@@ -1,0 +1,109 @@
+// SPDX-License-Identifier: MIT
+pragma language_version >= 0.16 && <= 0.17;
+
+import CompactStandardLibrary;
+
+/**
+ * @title Private Journal Contract
+ * @author ...
+ * @notice This smart contract enables users to privately create and delete
+ *         encrypted journal entries with an associated mood rating (1–10).
+ * @dev
+ *  - Journal entries are stored as `Opaque<"string">` values.
+ *  - The contract enforces single-entry occupancy at a time (`State.VACANT` or `State.OCCUPIED`).
+ *  - Each action is tied to the user's witness key for ownership verification.
+*/
+
+/** @dev Tracks whether the journal currently has an active entry */
+export enum State {
+  VACANT,
+  OCCUPIED
+}
+
+/** @dev Journal entry containing an encrypted thought and a mood rating */
+struct Entry {
+  /** @notice The encrypted journal thought (client-side encrypted string) */
+  thought: Opaque<"string">,
+  /** @notice User-provided mood rating, must be within range [1, 10] */
+  rating: Uint<8>
+}
+
+/** @dev Ledger variable storing the current journal state */
+export ledger state: State;
+
+/** @dev Ledger variable storing the active journal entry, if any */
+export ledger entry: Maybe<Entry>;
+
+/** @dev Ledger counter for unique entry sequencing and key derivation */
+export ledger sequence: Counter;
+
+/** @dev Ledger-stored owner key, derived from witness secret key */
+export ledger owner: Bytes<32>;
+
+/**
+ * @notice Initializes the journal contract in a vacant state.
+ * @dev
+ *  - Sets `state` to VACANT
+ *  - Clears any existing entry
+ *  - Increments sequence to prepare for first entry
+*/
+constructor() {
+  state = State.VACANT;
+  entry = none<Entry>();
+  sequence.increment(1);
+}
+
+/** @notice Local witness key, never revealed publicly */
+witness localSecretKey(): Bytes<32>;
+
+/**
+ * @notice Derives a public key for ownership verification.
+ * @param sk The secret witness key
+ * @param sequence A sequence value for deterministic uniqueness
+ * @return Bytes<32> A derived persistent public key
+*/
+export circuit publicKey(sk: Bytes<32>, sequence: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>([pad(32, "journal:pk:"), sequence, sk]);
+}
+
+/**
+ * @notice Post a new journal entry with a thought and mood rating.
+ * @dev
+ *  - Fails if the journal is already occupied.
+ *  - Fails if mood rating is not within [1, 10].
+ *  - Associates entry ownership with the caller's witness key.
+ * @param newThought Encrypted thought (opaque string)
+ * @param mood Mood rating between 1 and 10
+*/
+export circuit post(newThought: Opaque<"string">, mood: Uint<8>): [] {
+  assert(state == State.VACANT, "Cannot post: journal is already occupied");
+  assert(mood >= 1 && mood <= 10, "Mood must be between 1 and 10");
+
+  owner = disclose(publicKey(localSecretKey(), sequence as Field as Bytes<32>));
+  entry = disclose(some<Entry>(Entry{ thought: newThought, rating: mood }));
+  state = State.OCCUPIED;
+}
+
+/**
+ * @notice Delete the current journal entry and return its contents.
+ * @dev
+ *  - Fails if no entry is active.
+ *  - Fails if caller is not the entry owner.
+ *  - Resets state to VACANT and increments sequence.
+ * @return Entry The deleted entry (thought + rating)
+*/
+export circuit delete(): Entry {
+  assert(state == State.OCCUPIED, "Cannot delete: no active entry");
+  assert(
+    owner == publicKey(localSecretKey(), sequence as Field as Bytes<32>),
+    "Not authorized to delete this entry"
+  );
+
+  const former = entry.value;
+
+  state = State.VACANT;
+  sequence.increment(1);
+  entry = none<Entry>();
+
+  return former;
+}
